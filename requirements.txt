@@ -1,0 +1,4 @@
+psycopg2-binary>=2.9
+geopandas>=0.14
+fiona>=1.9
+pytest>=7.4
