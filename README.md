@@ -45,6 +45,9 @@ Code de sortie : `0` = validation réussie, `1` = au moins une erreur
 bloquante (rien n'est inséré), `2` = erreur d'exécution (fichier introuvable,
 connexion BD impossible).
 
+Un rapport JSON est écrit **dans tous les cas**, y compris lorsque la base de
+données est injoignable : voir [Erreurs de base de données](#erreurs-de-base-de-données).
+
 Paramètres de connexion : variables d'environnement `VALIDATION_PG_HOST`,
 `VALIDATION_PG_PORT`, `VALIDATION_PG_DB`, `VALIDATION_PG_USER`,
 `VALIDATION_PG_PASS`, `VALIDATION_PG_SCHEMA` (valeurs par défaut dans
@@ -54,8 +57,10 @@ Paramètres de connexion : variables d'environnement `VALIDATION_PG_HOST`,
 
 ```
 validation_insertion/
-├── config.py              # connexion BD, ordre des tables IPE
+├── config.py              # connexion BD, ordre des tables IPE, chemins des fichiers de référence
 ├── cli.py                 # point d'entrée ligne de commande (mode isolé)
+├── generate_column_aliases.py  # table-colonne-allias.xlsx -> column_aliases.json
+├── column_aliases.json    # libellés lisibles des colonnes (généré, lu par db_schema)
 ├── core/
 │   ├── models.py           # ValidationIssue, ValidationReport, LayerSchema
 │   ├── rule_base.py         # RuleContext, Rule, RuleKind (TRANSFORM/VALIDATION)
@@ -110,20 +115,39 @@ mélangent systématiquement des instructions du type "assigner automatiquement
 X" (TRANSFORM) et "vérifier que / interdire que" (VALIDATION).
 
 `RuleKind.LAYER` répond à un besoin distinct : une règle qui porte sur la
-**couche entière** et non sur une ligne précise — "au moins un enregistrement
-d'équipe", "au plus 15 formes de description d'habitat", "ce tuple doit être
-unique". Une telle règle ne peut pas être une VALIDATION ordinaire : le moteur
-boucle `for row in rows`, donc sur une couche à **zéro** ligne elle ne serait
-jamais appelée (exactement le cas que la règle « au moins un enregistrement »
-doit détecter). Une règle LAYER reçoit un `ctx.row` vide et travaille sur
-`ctx.all_rows` :
+**couche entière** et non sur une ligne précise — "au plus 15 formes de
+description d'habitat", "ce tuple doit être unique". Une telle règle ne peut
+pas être une VALIDATION ordinaire : elle produirait une anomalie dupliquée à
+chaque ligne, et sur une couche à **zéro** ligne le moteur ne l'appellerait
+même jamais (sa boucle `for row in rows` ne s'exécute pas). Une règle LAYER
+reçoit un `ctx.row` vide et travaille sur `ctx.all_rows` :
 
 ```python
-@register("equipe", kind=RuleKind.LAYER)
-def equipe_validation(ctx):
-    if len(ctx.all_rows) < 1:
+@register("forme_descr_habit", kind=RuleKind.LAYER)
+def forme_descr_habit_nombre_max(ctx):
+    if len(ctx.all_rows) > 15:
         return [ValidationIssue(...)]
     return []
+```
+
+### Vérifier l'absence d'enregistrements liés
+
+Le cas « chaque X doit avoir au moins un Y » ne se traite ni par une règle
+LAYER sur `Y`, ni par une VALIDATION sur `Y` : c'est l'**absence** de `Y`
+qu'il faut détecter, et parcourir les `Y` ne montrera jamais un `X` qui n'en
+a aucun. La règle s'enregistre donc sur la couche **parente** `X` et remonte
+vers l'enfant par `ctx.other_layer` — voir
+[`rules/equipe.py`](rules/equipe.py), qui vérifie que chaque `mesurage` est
+rattaché à au moins une équipe :
+
+```python
+@register("mesurage", kind=RuleKind.VALIDATION)
+def equipe_validation(ctx):
+    cle = (ctx.row.get("une_code_ident"), ctx.row.get("mes_no_seq"))
+    if any((e.get("une_code_ident"), e.get("mes_no_seq")) == cle
+           for e in ctx.other_layer("equipe")):
+        return []
+    return [ValidationIssue(severity=Severity.WARNING, ...)]
 ```
 
 ## Ajouter une règle
@@ -350,6 +374,40 @@ table traitée et génère automatiquement :
 Si un collègue ajoute une contrainte côté base de données, elle est prise en
 compte automatiquement, sans modifier ce dépôt.
 
+### Libellés des colonnes dans les messages
+
+Les messages produits par ces règles automatiques désignent les colonnes par
+leur **alias métier** plutôt que par leur nom technique :
+
+> Le champ « Date du début de l'inventaire » est obligatoire (contrainte NOT NULL).
+
+et non « Le champ `ing_date_debut_inven` … », illisible pour la personne qui
+a rempli le formulaire.
+
+Les alias proviennent de [`column_aliases.json`](column_aliases.json), généré
+depuis le classeur `table-colonne-allias.xlsx` :
+
+```bash
+python generate_column_aliases.py    # à relancer si le classeur change
+```
+
+Le script n'utilise que la bibliothèque standard (`zipfile` + `xml.etree` :
+un `.xlsx` est une archive ZIP de XML), et le JSON produit se lit avec
+`json` : **aucune dépendance supplémentaire** n'est requise, ni pour générer
+le fichier ni pour l'utiliser à l'exécution.
+
+Points de conception :
+
+- La table est indexée par **(table, colonne)** et non par colonne seule :
+  13 colonnes portent un libellé différent selon la table (ex. `efa_code`
+  = « Espèce » dans `detail_speci` mais « Espèce visée » dans `peche_exper`).
+- `core.db_schema.column_label(layer, column)` **retombe sur le nom technique**
+  si l'alias est inconnu, et un fichier JSON absent ou illisible ne fait
+  jamais échouer une validation.
+- Seul le `message` change : le champ `fields` de chaque anomalie continue de
+  porter le nom **technique** de la colonne, puisqu'il est lu par QField/QGIS
+  pour mettre le bon champ en évidence dans le formulaire.
+
 ## Le rapport JSON
 
 Format (voir [`core/models.py::ValidationReport.to_dict`](core/models.py)) :
@@ -377,18 +435,58 @@ Format (voir [`core/models.py::ValidationReport.to_dict`](core/models.py)) :
 }
 ```
 
-`severity: "warning"` n'empêche PAS l'insertion (ex. coefficient de
-condition biologique hors bornes) ; seul `"error"` bloque le lot entier.
+`severity: "warning"` n'empêche PAS l'insertion — ex. coefficient de
+condition biologique hors bornes, ou mesurage sans équipe de travail
+rattachée : ce sont des saisies à vérifier, pas des incohérences qui
+rendraient les données inexploitables. Seul `"error"` bloque le lot entier.
+
+### Erreurs de base de données
+
+Les incidents de communication avec PostgreSQL **figurent dans le rapport**
+au lieu de n'exister que dans les journaux du conteneur : ils portent la
+pseudo-couche `(base de données)` — un nom qu'aucune vraie table ne peut
+porter, donc filtrable de façon fiable :
+
+```json
+{
+  "layer": "(base de données)",
+  "severity": "error",
+  "code": "DB_CONNEXION_IMPOSSIBLE",
+  "message": "Connexion à PostgreSQL impossible (hôte db:5432, base ifa). Détail technique : OperationalError: could not connect to server: Connection refused",
+  "fields": [],
+  "record": {},
+  "rule_name": "cli.connect"
+}
+```
+
+| Code | Quand | Conséquence |
+|---|---|---|
+| `DB_CONNEXION_IMPOSSIBLE` | La connexion n'a pas pu être ouverte (`cli.py`) | Rapport écrit, code de sortie `2` |
+| `DB_SCHEMA_INDISPONIBLE` | Échec de `load_schema` (base injoignable, droits, schéma absent) | Les règles métier sont **quand même** appliquées, mais rien n'est inséré |
+| `DB_INSERTION_ECHOUEE` | Échec de `insert_all` | Transaction annulée (rollback), nom de la table fautive cité dans le message |
+
+Points de conception :
+
+- **Aucune exception ne remonte** de `engine.run` pour ces cas : un rapport
+  est toujours produit, y compris quand la connexion échoue avant même la
+  validation (`layers_processed` est alors vide).
+- Le message contient le **type et le texte de l'exception du driver**,
+  repliés sur une seule ligne (les messages psycopg2 sont multilignes).
+- Une erreur de base de données rend le rapport invalide, ce qui **empêche
+  l'insertion** : on n'insère jamais des données dont les contraintes de la
+  base n'ont pas pu être vérifiées.
+- Le résumé console affiche ces erreurs **en entier** et séparément des
+  erreurs de saisie (qui, elles, sont comptées par couche).
 
 ## Tests
 
 ```bash
 # Depuis le dossier validation_insertion/
-pip install -r requirements.txt   # inclut pytest, geopandas, psycopg2-binary
+pip install -r requirements.txt   # psycopg2-binary + pytest (aucune bibliothèque GIS)
 python -m pytest tests -q
 ```
 
-326 tests à la rédaction de ce document, organisés en :
+369 tests à la rédaction de ce document, organisés en :
 - tests du moteur (`core/`) avec des doublures pour la base de données
   (jamais de connexion PostgreSQL réelle requise pour la suite automatisée) ;
 - un fichier de test par module de règles, appelant les fonctions
@@ -396,6 +494,14 @@ python -m pytest tests -q
 - `tests/test_gpkg_reader.py` utilise un vrai petit GeoPackage généré à la
   volée (fixture `sample_gpkg`) pour valider la lecture réelle, sans fichier
   externe à maintenir.
+
+La fixture `sample_gpkg` construit ce GeoPackage avec **`sqlite3` seul**
+(`tests/conftest.py::creer_gpkg`), comme le lecteur qui le relit : tables de
+métadonnées `gpkg_contents` / `gpkg_geometry_columns` / `gpkg_spatial_ref_sys`,
+identifiant d'application « GPKG » et géométries au format GeoPackageBinary.
+La suite de tests s'exécute donc dans le même environnement "nu" que le
+conteneur QFieldCloud visé — aucune bibliothèque GIS n'est requise, ni pour
+lire un GeoPackage, ni pour en fabriquer un.
 
 Ajouter une règle implique d'ajouter son test dans le fichier
 `tests/test_rules_<couche>.py` correspondant (créer le fichier s'il n'existe
@@ -432,6 +538,52 @@ choix retenu est expliqué en commentaire à l'endroit concerné du code :
 
 ## Intégration QFieldCloud
 
+Ce dépôt est **directement déployable** : il contient tout ce dont le worker
+QFieldCloud a besoin, y compris les adaptations propres à cet environnement
+(exclusion de `rapport_validation`, upsert `ON CONFLICT`). Aucune modification
+locale n'est à réappliquer après une copie.
+
+### Ce qu'il faut copier
+
+Le worker attend le programme dans
+`docker-qgis/qfc_worker/validation_ifa/`, où le point d'entrée
+`validate_ifa.py` l'ajoute à `sys.path` avant d'importer `config` et
+`core.engine`.
+
+| À copier | Pourquoi |
+|---|---|
+| `config.py` | chemins des fichiers de référence + connexion |
+| `core/`, `rules/` | le moteur et les règles |
+| `column_aliases.json` | libellés lisibles des colonnes |
+| `lac_LCE.txt`, `cours_eau_LCE.txt` | référentiel des plans d'eau |
+
+Inutiles en production : `tests/`, `cli.py` (le point d'entrée est
+`validate_ifa.py`), `generate_column_aliases.py` et `table-colonne-allias.xlsx`
+(outils de génération hors ligne), `Règles IFA 2.0/`.
+
+> **`config.py` et `core/db_schema.py` vont ensemble.** Le repli en cas de
+> fichier d'alias manquant ne couvre que les erreurs d'ouverture et de format ;
+> un `config.py` dépareillé, sans `COLUMN_ALIASES_PATH`, lève un
+> `AttributeError`. Copier `column_aliases.json` en même temps, sinon les
+> messages retombent silencieusement sur les noms techniques de colonnes.
+
+### Deux comportements spécifiques au déploiement
+
+- **`rapport_validation` n'est jamais insérée en base.** Le worker écrit cette
+  table *dans* le GeoPackage comme restitution pour le technicien, et
+  l'enregistre dans `gpkg_contents`. Au passage suivant, le lecteur la voit
+  donc comme une couche ordinaire : sans l'exclusion de
+  `inserter.NON_INSERTABLE_TABLES`, elle serait réinjectée vers une relation
+  PostgreSQL inexistante et **tout le lot serait rejeté à chaque
+  synchronisation**.
+- **Un second envoi met à jour au lieu d'échouer.** `insert_all` reçoit les
+  schémas (donc les clés primaires) et construit un `ON CONFLICT … DO UPDATE` :
+  un technicien qui pousse deux fois le même mesurage corrige ses données, il
+  ne crée pas un doublon. Sans les schémas, la clause n'est pas émise et un
+  doublon lèverait une erreur — d'où le test qui verrouille ce passage.
+
+### Points d'attention
+
 Ce programme a été développé et testé **isolément** (connexion PostgreSQL
 directe, exécution manuelle via `cli.py`). Pour l'intégrer au conteneur
 QFieldCloud :
@@ -445,10 +597,11 @@ QFieldCloud :
    variables d'environnement déjà injectées par QFieldCloud pour sa propre
    base, ou à exposer séparément selon que la base IFA est distincte de la
    base QFieldCloud.
-3. **Dépendances** : `geopandas`/`fiona` ne sont pas des dépendances de
-   PyQGIS — elles s'installent par `pip` dans n'importe quel environnement
-   Python "nu", ce qui a guidé leur choix plutôt que PyQGIS pour la lecture
-   du GeoPackage (voir [`core/gpkg_reader.py`](core/gpkg_reader.py)).
+3. **Dépendances** : la lecture du GeoPackage n'utilise que `sqlite3` de la
+   bibliothèque standard — un GeoPackage EST une base SQLite (voir
+   [`core/gpkg_reader.py`](core/gpkg_reader.py)). Ni PyQGIS, ni
+   geopandas/fiona/GDAL ne sont requis : `psycopg2-binary` est la seule
+   dépendance d'exécution, `pytest` la seule dépendance de test.
 4. **Rapport** : le JSON produit par `core/report.py` est déjà conçu pour
    être renvoyé tel quel par une réponse HTTP/API QFieldCloud à l'utilisateur.
 5. **Transaction** : `core/inserter.py` insère tout dans une seule

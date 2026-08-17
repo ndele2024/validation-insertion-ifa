@@ -1,0 +1,159 @@
+# ---------------------------------------------------------------------------
+# Synchronisation du moteur de validation vers le dépôt QFieldCloud-ifa.
+#
+# À chaque push (donc aussi à chaque merge de pull request) sur la branche
+# main de ce dépôt, les fichiers nécessaires à l'exécution sont recopiés dans
+# QfieldCloud-ifa/docker-qgis/qfc_worker/validation_ifa, puis commités.
+#
+# Objectif : que la version déployée ne puisse plus diverger de la source.
+#
+# PRÉREQUIS — un jeton d'accès au dépôt CIBLE :
+#   Le jeton automatique GITHUB_TOKEN ne donne des droits que sur le dépôt
+#   courant. Pour écrire dans un AUTRE dépôt il faut un jeton personnel :
+#     1. github.com/settings/personal-access-tokens → "Generate new token"
+#        (fine-grained), dépôt sélectionné : ndele2024/QfieldCloud-ifa,
+#        permission "Contents" = Read and write.
+#     2. Dans CE dépôt : Settings → Secrets and variables → Actions →
+#        "New repository secret", nom : QFIELDCLOUD_IFA_TOKEN.
+# ---------------------------------------------------------------------------
+
+name: Synchroniser vers QFieldCloud-ifa
+
+on:
+  push:
+    branches: [main]
+  # Permet aussi de relancer la synchronisation à la main depuis l'onglet
+  # Actions, sans avoir à pousser un commit (utile après un échec).
+  workflow_dispatch:
+
+# Deux pushes rapprochés lanceraient deux synchronisations en parallèle, dont
+# la seconde pousserait par-dessus la première. On sérialise : le job en cours
+# se termine avant que le suivant ne démarre.
+concurrency:
+  group: sync-validation-ifa
+  cancel-in-progress: false
+
+env:
+  DEPOT_CIBLE: ndele2024/QfieldCloud-ifa
+  BRANCHE_CIBLE: romuald
+  DOSSIER_CIBLE: docker-qgis/qfc_worker/validation_ifa
+
+jobs:
+  synchroniser:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---- 1. Récupérer les deux dépôts côte à côte -----------------------
+      - name: Cloner le dépôt source
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Cloner le dépôt cible
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPOT_CIBLE }}
+          ref: ${{ env.BRANCHE_CIBLE }}
+          # Sans ce jeton, le clone d'un dépôt tiers échoue et le push serait
+          # de toute façon refusé.
+          token: ${{ secrets.QFIELDCLOUD_IFA_TOKEN }}
+          path: cible
+
+      # ---- 2. Ne jamais déployer un moteur cassé --------------------------
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Lancer la suite de tests
+        working-directory: source
+        run: |
+          pip install --quiet -r requirements.txt
+          python -m pytest tests -q
+
+      # ---- 3. Construire l'arborescence à déployer ------------------------
+      # On assemble d'abord une copie propre dans un dossier temporaire, au
+      # lieu de copier directement dans la cible. Cela permet à l'étape
+      # suivante de comparer deux arborescences complètes et donc de
+      # répercuter aussi les SUPPRESSIONS de fichiers.
+      - name: Préparer les fichiers à copier
+        id: preparer
+        run: |
+          set -euo pipefail
+          ASSEMBLAGE="$RUNNER_TEMP/assemblage"
+          mkdir -p "$ASSEMBLAGE"
+          cd source
+
+          # Dossiers de code
+          for dossier in core rules; do
+            cp -r "$dossier" "$ASSEMBLAGE/"
+          done
+
+          # Fichiers nommés explicitement
+          for fichier in config.py __init__.py cli.py generate_column_aliases.py; do
+            [ -f "$fichier" ] && cp "$fichier" "$ASSEMBLAGE/"
+          done
+
+          # Fichiers de données et documentation, à la RACINE uniquement
+          # (-maxdepth 1) : sans cela on ramasserait aussi les .json et .md
+          # situés dans .github/ ou tests/.
+          for motif in '*.txt' '*.xlsx' '*.json' '*.md'; do
+            find . -maxdepth 1 -type f -name "$motif" -exec cp {} "$ASSEMBLAGE/" \;
+          done
+
+          # Garde-fou : une faute de syntaxe ne doit pas partir en production.
+          python -m compileall -q "$ASSEMBLAGE"
+
+          # Le cache d'octets Python n'a rien à faire dans un dépôt. À faire
+          # APRÈS compileall, qui vient précisément de le (re)générer.
+          find "$ASSEMBLAGE" -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find "$ASSEMBLAGE" -type f -name '*.pyc' -delete
+
+          echo "assemblage=$ASSEMBLAGE" >> "$GITHUB_OUTPUT"
+          echo "Fichiers prêts :"
+          find "$ASSEMBLAGE" -type f | sed "s|$ASSEMBLAGE/||" | sort
+
+      # ---- 4. Recopier dans le dépôt cible --------------------------------
+      - name: Copier dans le dépôt cible
+        run: |
+          set -euo pipefail
+          DESTINATION="cible/${{ env.DOSSIER_CIBLE }}"
+          mkdir -p "$DESTINATION"
+          # --delete supprime dans la destination ce qui n'existe plus dans
+          # l'assemblage : un fichier retiré de la source disparaît donc aussi
+          # du déploiement. La portée est limitée à ce seul dossier, le reste
+          # du dépôt QFieldCloud n'est jamais touché.
+          rsync -a --delete "${{ steps.preparer.outputs.assemblage }}/" "$DESTINATION/"
+
+      # ---- 5. Commiter et pousser, seulement s'il y a un changement -------
+      - name: Commiter et pousser
+        working-directory: cible
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- "${{ env.DOSSIER_CIBLE }}"
+
+          # --quiet renvoie 0 si l'index est identique au dernier commit.
+          # Sans ce test, chaque push sur la source créerait un commit vide.
+          if git diff --cached --quiet; then
+            echo "Aucun changement : le déploiement est déjà à jour."
+            exit 0
+          fi
+
+          echo "Changements détectés :"
+          git diff --cached --stat
+
+          # On cite le commit d'origine : depuis le dépôt QFieldCloud, on peut
+          # ainsi remonter à la modification exacte qui l'a provoqué.
+          git commit -m "Synchronisation validation_ifa depuis validation-insertion-ifa@${GITHUB_SHA::7}
+
+          Source : ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          Déclenché par : ${{ github.actor }}"
+
+          # Un autre commit a pu arriver sur la cible entre le clone et le
+          # push : on rejoue notre commit par-dessus au lieu d'échouer.
+          git pull --rebase origin "${{ env.BRANCHE_CIBLE }}"
+          git push origin HEAD:"${{ env.BRANCHE_CIBLE }}"
+          echo "Déploiement mis à jour."
