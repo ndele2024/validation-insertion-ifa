@@ -35,7 +35,7 @@ concurrency:
 
 env:
   DEPOT_CIBLE: ndele2024/QfieldCloud-ifa
-  BRANCHE_CIBLE: romuald
+  BRANCHE_CIBLE: main
   DOSSIER_CIBLE: docker-qgis/qfc_worker/validation_ifa
 
 jobs:
